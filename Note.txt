@@ -1,0 +1,19 @@
+1. Pretrained voi MRI nao -> Failed
+2. Thay max-pooling theo slice = mean + max pooling -> ?
+3. FC deeper + Dropout
+5. Update train/eval pipeline (2026-05-02):
+   - Doi optimizer tu Adam sang SGD (lr=1e-3, momentum=0.7).
+   - Bo warm-start tu abnormal sang ACL/Meniscus (khong dung abnormal.pth de ho tro).
+   - Metric uu tien doi thanh SE/SP va Balanced Accuracy:
+     + SE = TP/(TP+FN)
+     + SP = TN/(TN+FP)
+     + Balanced Acc = (SE + SP)/2
+   - Threshold tuning tren valid doi tu toi uu F1 sang toi uu Balanced Accuracy.
+   - Test van dung threshold tim duoc tu valid (tranh data leakage).
+   - Ho tro chay nhieu run doc lap:
+     + Them num_runs (mac dinh 10) va base_seed (mac dinh 42).
+     + Moi run dung seed khac nhau: base_seed + run_idx.
+     + Moi run luu output rieng: weights/<task>/run_xx va evaluation/<model>_<task>/run_xx.
+   - Them file tong hop ket qua nhieu run:
+     + evaluation/<model>_<task>/<model>_<task>_runs_summary.csv
+     + In mean+-std val_auc va test_auc sau khi chay xong 10 run.
