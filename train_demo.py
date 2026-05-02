@@ -45,6 +45,60 @@ def _set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def _parse_gpu_ids(gpu_ids_cfg, num_available):
+    if num_available <= 0:
+        return []
+
+    if gpu_ids_cfg is None:
+        return list(range(num_available))
+
+    if isinstance(gpu_ids_cfg, str):
+        gpu_ids_cfg = [x.strip() for x in gpu_ids_cfg.split(",") if x.strip()]
+
+    if isinstance(gpu_ids_cfg, int):
+        gpu_ids_cfg = [gpu_ids_cfg]
+
+    parsed = []
+    for gpu_id in gpu_ids_cfg:
+        try:
+            idx = int(gpu_id)
+        except Exception:
+            continue
+        if 0 <= idx < num_available:
+            parsed.append(idx)
+
+    if not parsed:
+        return list(range(num_available))
+    return sorted(list(dict.fromkeys(parsed)))
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def _get_model_state_dict(model):
+    return _unwrap_model(model).state_dict()
+
+
+def _load_flexible_state_dict(model, state_dict):
+    target_model = _unwrap_model(model)
+    target_state = target_model.state_dict()
+
+    if not state_dict:
+        target_model.load_state_dict(state_dict)
+        return
+
+    has_module_prefix_target = next(iter(target_state.keys())).startswith("module.")
+    has_module_prefix_src = next(iter(state_dict.keys())).startswith("module.")
+
+    if has_module_prefix_src and not has_module_prefix_target:
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    elif not has_module_prefix_src and has_module_prefix_target:
+        state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+
+    target_model.load_state_dict(state_dict)
+
+
 def _run_epoch(
     model,
     loader,
@@ -72,8 +126,8 @@ def _run_epoch(
         images, label = batch
 
         if device != "cpu":
-            images = [img.to(device) for img in images]
-            label = label.to(device)
+            images = [img.to(device, non_blocking=True) for img in images]
+            label = label.to(device, non_blocking=True)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -275,23 +329,36 @@ def train(
 
     print("Initializing Model...")
     model = _build_model(model_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
-        model = model.cuda()
-        train_wts = train_wts.cuda()
-        val_wts = val_wts.cuda()
+    device = "cpu"
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_data_parallel = bool(config.get("use_data_parallel", True))
+    gpu_ids = _parse_gpu_ids(config.get("gpu_ids", None), num_gpus)
+
+    if num_gpus > 0:
+        primary_gpu = gpu_ids[0] if gpu_ids else 0
+        device = f"cuda:{primary_gpu}"
+        model = model.to(device)
+        if use_data_parallel and len(gpu_ids) > 1:
+            model = torch.nn.DataParallel(model, device_ids=gpu_ids, output_device=primary_gpu)
+            print(f"DataParallel enabled on GPUs: {gpu_ids}")
+        else:
+            print(f"DataParallel disabled. Using single GPU (available={num_gpus}, selected={gpu_ids[:1]}).")
+        train_wts = train_wts.to(device)
+        val_wts = val_wts.to(device)
         if test_wts is not None:
-            test_wts = test_wts.cuda()
+            test_wts = test_wts.to(device)
+    else:
+        print("Running on CPU.")
 
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
     val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=val_wts)
     test_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=test_wts) if test_wts is not None else val_criterion
-    if device == "cuda":
-        criterion = criterion.cuda()
-        val_criterion = val_criterion.cuda()
+    if device != "cpu":
+        criterion = criterion.to(device)
+        val_criterion = val_criterion.to(device)
         if test_wts is not None:
-            test_criterion = test_criterion.cuda()
+            test_criterion = test_criterion.to(device)
 
     print("Setup the Optimizer")
     optimizer = torch.optim.SGD(
@@ -303,7 +370,7 @@ def train(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=3, factor=0.3, threshold=1e-4
     )
-    use_amp = bool(device == "cuda")
+    use_amp = bool(config.get("use_amp", True) and device != "cpu")
     scaler = GradScaler(enabled=use_amp)
     print(f"AMP enabled: {use_amp}")
 
@@ -446,7 +513,7 @@ def train(
             print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _get_model_state_dict(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
@@ -458,7 +525,7 @@ def train(
 
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": _get_model_state_dict(model),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
@@ -483,7 +550,7 @@ def train(
     # Load best model for final evaluation/plots
     if os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        _load_flexible_state_dict(model, checkpoint["model_state_dict"])
 
     model.eval()
     _, val_true, val_prob = _run_epoch(
@@ -624,12 +691,50 @@ if __name__ == "__main__":
         default=int(base_config.get("base_seed", 42)),
         help="Base random seed. Each run uses base_seed + run_idx.",
     )
+    parser.add_argument(
+        "--amp",
+        dest="use_amp",
+        action="store_true",
+        help="Enable mixed precision training.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        dest="use_amp",
+        action="store_false",
+        help="Disable mixed precision training.",
+    )
+    parser.set_defaults(use_amp=None)
+    parser.add_argument(
+        "--data-parallel",
+        dest="use_data_parallel",
+        action="store_true",
+        help="Enable torch.nn.DataParallel when multiple GPUs are available.",
+    )
+    parser.add_argument(
+        "--no-data-parallel",
+        dest="use_data_parallel",
+        action="store_false",
+        help="Disable DataParallel.",
+    )
+    parser.set_defaults(use_data_parallel=None)
+    parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help='Comma-separated GPU ids for DataParallel, e.g. "0,1".',
+    )
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for task in tasks:
         cfg = dict(base_config)
         cfg["task"] = task
+        if args.use_amp is not None:
+            cfg["use_amp"] = bool(args.use_amp)
+        if args.use_data_parallel is not None:
+            cfg["use_data_parallel"] = bool(args.use_data_parallel)
+        if args.gpu_ids is not None:
+            cfg["gpu_ids"] = args.gpu_ids
         print("Training Configuration")
         print(cfg)
         run_results = []

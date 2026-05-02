@@ -17,4 +17,7 @@ config = {
     'num_workers' : 2,
     'num_runs' : 5,
     'base_seed' : 42,
+    'use_amp' : True,
+    'use_data_parallel' : True,
+    'gpu_ids' : [0, 1],
 }

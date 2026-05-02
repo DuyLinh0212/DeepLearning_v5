@@ -1,4 +1,5 @@
 import torch
+from torch.cuda.amp import autocast
 from sklearn import metrics
 import numpy as np
 
@@ -10,7 +11,18 @@ def _get_trainable_params(model):
             trainable_params.append(x)
     return trainable_params
 
-def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, current_lr, log_every=20):
+def _evaluate_model(
+    model,
+    val_loader,
+    criterion,
+    epoch,
+    num_epochs,
+    writer,
+    current_lr,
+    log_every=20,
+    device='cpu',
+    use_amp=False,
+):
     """Runs model over val dataset and returns auc and avg val loss"""
 
     # Set to eval mode
@@ -29,12 +41,13 @@ def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, cur
         images, label = batch
         # If GPU is available, load the images and label
         # on GPU
-        if torch.cuda.is_available():
-            images = [image.cuda() for image in images]
-            label = label.cuda()
+        if device != 'cpu':
+            images = [image.to(device, non_blocking=True) for image in images]
+            label = label.to(device, non_blocking=True)
 
         # Obtain the model output by passing the images as input
-        output = model(images)
+        with autocast(enabled=bool(use_amp and device != 'cpu')):
+            output = model(images)
         # Evaluate the loss by comparing the output and groundtruth label
         loss = criterion(output, label)
         # Add loss to the list of losses
@@ -44,9 +57,9 @@ def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, cur
         # sigmoid function on model output
         probas = torch.sigmoid(output)
         # Add the groundtruth to the list of groundtruths
-        y_gt.append(int(label.item()))
-        # Add predicted probability to the list
-        y_probs.append(probas.item())
+        y_gt.extend(label.detach().cpu().view(-1).numpy().astype(int).tolist())
+        # Add predicted probabilities to the list
+        y_probs.extend(probas.detach().cpu().view(-1).numpy().tolist())
 
         try:
             # Evaluate area under ROC curve based on the groundtruth label
@@ -80,7 +93,20 @@ def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, cur
 
     return val_loss_epoch, val_auc_epoch
 
-def _train_model(model, train_loader, epoch, num_epochs, optimizer, criterion, writer, current_lr, log_every=100):
+def _train_model(
+    model,
+    train_loader,
+    epoch,
+    num_epochs,
+    optimizer,
+    criterion,
+    writer,
+    current_lr,
+    log_every=100,
+    device='cpu',
+    use_amp=False,
+    scaler=None,
+):
     
     # Set to train mode
     model.train()
@@ -103,20 +129,26 @@ def _train_model(model, train_loader, epoch, num_epochs, optimizer, criterion, w
         
         # If GPU is available, transfer the images and label
         # to the GPU
-        if torch.cuda.is_available():
-            images = [image.cuda() for image in images]
-            label = label.cuda()
+        if device != 'cpu':
+            images = [image.to(device, non_blocking=True) for image in images]
+            label = label.to(device, non_blocking=True)
 
         # Obtain the prediction using the model
-        output = model(images)
+        with autocast(enabled=bool(use_amp and device != 'cpu')):
+            output = model(images)
 
         # Evaluate the loss by comparing the prediction
         # and groundtruth label
         loss = criterion(output, label)
-        # Perform a backward propagation
-        loss.backward()
-        # Modify the weights based on the error gradient
-        optimizer.step()
+        if scaler is not None and bool(use_amp and device != 'cpu'):
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Perform a backward propagation
+            loss.backward()
+            # Modify the weights based on the error gradient
+            optimizer.step()
 
         # Add current loss to the list of losses
         loss_value = loss.item()
@@ -126,9 +158,9 @@ def _train_model(model, train_loader, epoch, num_epochs, optimizer, criterion, w
         probas = torch.sigmoid(output)
 
         # Add current groundtruth label to the list of groundtruths
-        y_gt.append(int(label.item()))
+        y_gt.extend(label.detach().cpu().view(-1).numpy().astype(int).tolist())
         # Add current probabilities to the list of probabilities
-        y_probs.append(probas.item())
+        y_probs.extend(probas.detach().cpu().view(-1).numpy().tolist())
 
         try:
             # Try finding the area under ROC curve

@@ -17,3 +17,5 @@
    - Them file tong hop ket qua nhieu run:
      + evaluation/<model>_<task>/<model>_<task>_runs_summary.csv
      + In mean+-std val_auc va test_auc sau khi chay xong 10 run.
+6. Thêm self-attention cho efficientNetB0_SA.py + batch size = 2 + lr = 1e-5 -> Failed (quá chậm)
+7. Thêm self-attention cho efficientNetB0_SA.py + batch size = 2 + lr = 1e-4
