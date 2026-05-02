@@ -20,4 +20,9 @@ config = {
     'use_amp' : True,
     'use_data_parallel' : True,
     'gpu_ids' : [0, 1],
+    # Warm-start from abnormal best checkpoint (optional)
+    'use_warm_start' : False,
+    'warm_start_path' : 'weights/abnormal/run_01/efficientnetb0_sa_best_model.pth',
+    'warm_start_tasks' : ['acl', 'meniscus'], # use ['all'] to apply all tasks
+    'warm_start_strict' : True,
 }

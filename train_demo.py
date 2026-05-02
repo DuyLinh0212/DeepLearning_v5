@@ -80,7 +80,7 @@ def _get_model_state_dict(model):
     return _unwrap_model(model).state_dict()
 
 
-def _load_flexible_state_dict(model, state_dict):
+def _load_flexible_state_dict(model, state_dict, strict=True):
     target_model = _unwrap_model(model)
     target_state = target_model.state_dict()
 
@@ -96,7 +96,71 @@ def _load_flexible_state_dict(model, state_dict):
     elif not has_module_prefix_src and has_module_prefix_target:
         state_dict = {f"module.{k}": v for k, v in state_dict.items()}
 
-    target_model.load_state_dict(state_dict)
+    return target_model.load_state_dict(state_dict, strict=strict)
+
+
+def _normalize_task_filter(tasks):
+    if tasks is None:
+        return None
+
+    if isinstance(tasks, str):
+        parsed = [x.strip().lower() for x in tasks.split(",") if x.strip()]
+    elif isinstance(tasks, (list, tuple, set)):
+        parsed = [str(x).strip().lower() for x in tasks if str(x).strip()]
+    else:
+        return None
+
+    if not parsed:
+        return None
+    if "all" in parsed or "*" in parsed:
+        return None
+    return set(parsed)
+
+
+def _maybe_warm_start(model, config, model_name, device):
+    use_warm_start = bool(config.get("use_warm_start", False))
+    if not use_warm_start:
+        print("Warm-start disabled. Run starts from scratch.")
+        return
+
+    task_name = str(config.get("task", "")).strip().lower()
+    task_filter = _normalize_task_filter(config.get("warm_start_tasks", None))
+    if task_filter is not None and task_name not in task_filter:
+        print(f"Warm-start enabled but skipped for task={task_name} (not in warm_start_tasks).")
+        return
+
+    warm_start_path = config.get("warm_start_path", None)
+    if not warm_start_path:
+        print("Warm-start enabled but warm_start_path is empty. Run starts from scratch.")
+        return
+
+    warm_start_path = os.path.abspath(os.path.expanduser(str(warm_start_path)))
+    if not os.path.exists(warm_start_path):
+        print(f"Warm-start enabled but checkpoint not found: {warm_start_path}. Run starts from scratch.")
+        return
+
+    print(f"Loading warm-start checkpoint: {warm_start_path}")
+    checkpoint = torch.load(warm_start_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        ckpt_model_name = str(checkpoint.get("model_name", "")).strip().lower()
+        if ckpt_model_name and ckpt_model_name != str(model_name).strip().lower():
+            print(
+                f"Warm-start model mismatch (checkpoint={ckpt_model_name}, current={model_name}). "
+                "Skip warm-start."
+            )
+            return
+    else:
+        state_dict = checkpoint
+
+    strict = bool(config.get("warm_start_strict", True))
+    load_result = _load_flexible_state_dict(model, state_dict, strict=strict)
+    missing = len(getattr(load_result, "missing_keys", []))
+    unexpected = len(getattr(load_result, "unexpected_keys", []))
+    print(
+        f"Warm-start loaded successfully (strict={strict}) | "
+        f"missing_keys={missing} | unexpected_keys={unexpected}"
+    )
 
 
 def _run_epoch(
@@ -350,6 +414,8 @@ def train(
     else:
         print("Running on CPU.")
 
+    _maybe_warm_start(model, config, model_name=model_name, device=device)
+
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
     val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=val_wts)
@@ -379,8 +445,6 @@ def train(
     best_val_auc = float(0)
     patience = config.get("patience", 5)
     epochs_no_improve = 0
-
-    print("Run starts from scratch (no abnormal warm-start, no checkpoint resume).")
 
     writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={config['task']} {run_name}")
     t_start_training = time.time()
@@ -723,6 +787,44 @@ if __name__ == "__main__":
         default=None,
         help='Comma-separated GPU ids for DataParallel, e.g. "0,1".',
     )
+    parser.add_argument(
+        "--warm-start",
+        dest="use_warm_start",
+        action="store_true",
+        help="Enable warm-start from checkpoint path in config/CLI.",
+    )
+    parser.add_argument(
+        "--no-warm-start",
+        dest="use_warm_start",
+        action="store_false",
+        help="Disable warm-start.",
+    )
+    parser.set_defaults(use_warm_start=None)
+    parser.add_argument(
+        "--warm-start-path",
+        type=str,
+        default=None,
+        help="Checkpoint path for warm-start model weights.",
+    )
+    parser.add_argument(
+        "--warm-start-tasks",
+        type=str,
+        default=None,
+        help='Tasks that apply warm-start, comma-separated (e.g. "acl,meniscus" or "all").',
+    )
+    parser.add_argument(
+        "--warm-start-strict",
+        dest="warm_start_strict",
+        action="store_true",
+        help="Load warm-start checkpoint with strict=True.",
+    )
+    parser.add_argument(
+        "--warm-start-nonstrict",
+        dest="warm_start_strict",
+        action="store_false",
+        help="Load warm-start checkpoint with strict=False.",
+    )
+    parser.set_defaults(warm_start_strict=None)
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -735,6 +837,14 @@ if __name__ == "__main__":
             cfg["use_data_parallel"] = bool(args.use_data_parallel)
         if args.gpu_ids is not None:
             cfg["gpu_ids"] = args.gpu_ids
+        if args.use_warm_start is not None:
+            cfg["use_warm_start"] = bool(args.use_warm_start)
+        if args.warm_start_path is not None:
+            cfg["warm_start_path"] = args.warm_start_path
+        if args.warm_start_tasks is not None:
+            cfg["warm_start_tasks"] = args.warm_start_tasks
+        if args.warm_start_strict is not None:
+            cfg["warm_start_strict"] = bool(args.warm_start_strict)
         print("Training Configuration")
         print(cfg)
         run_results = []
