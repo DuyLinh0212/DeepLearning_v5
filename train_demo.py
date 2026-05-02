@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import load_data
 from config import config as base_config
-from models import Densenet121, EfficientNetB0
+from models import Densenet121, EfficientNetB0, EfficientNetB0_SA
 from utils import _get_lr
 
 import matplotlib
@@ -30,6 +30,8 @@ def _build_model(name: str):
         return Densenet121()
     if name == "efficientnetb0":
         return EfficientNetB0()
+    if name == "efficientnetb0_sa":
+        return EfficientNetB0_SA()
     raise ValueError(f"Unsupported model: {name}")
 
 
@@ -589,7 +591,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="efficientnetb0",
-        choices=["densenet121", "efficientnetb0"],
+        choices=["densenet121", "efficientnetb0", "efficientnetb0_sa"],
         help="Choose model to train",
     )
     parser.add_argument(

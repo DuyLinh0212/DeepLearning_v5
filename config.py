@@ -15,6 +15,6 @@ config = {
     'image_size' : 224,
     'target_slices' : 24,
     'num_workers' : 2,
-    'num_runs' : 10,
+    'num_runs' : 5,
     'base_seed' : 42,
 }
